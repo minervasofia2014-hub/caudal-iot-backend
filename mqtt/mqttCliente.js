@@ -9,6 +9,10 @@ const conexionMqtt = mqtt.connect(servidorMqtt, {
     //Creamos un identificador único para este cliente, combinando el nombre del proyecto con un número aleatorio
     //Si la conexion del servidor se pierde , intentará reconectarse cada 3 segundos
     clientId: 'acueducto_veredal' + Math.random().toString(16).slice(2, 10), reconnectPeriod: 3000,
+    //Usuario y contraseña del broker privado (HiveMQ Cloud). Con el broker publico anterior no hacian falta,
+    //pero con un cluster propio son obligatorios para poder conectarse.
+    username: process.env.MQTT_USERNAME,
+    password: process.env.MQTT_PASSWORD,
 });
 
 //Cuando tengamos conexión al broker, nos mostrara un mensaje en la consola
