@@ -25,7 +25,22 @@ app.use(cors(opcionesCors));
 app.use(express.json());
 
 //Aca es donde se conecta el MongoDB utilizando el URL de definida de las variables de entorno como es el MONGODB_URI
-mongoose.connect(process.env.MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI, {
+    //Antes no habia limite: cada consulta que llegaba mientras la conexion estaba caida
+    //se quedaba esperando en memoria hasta 30 segundos por defecto. Con el dashboard
+    //haciendo varias consultas cada 3 segundos, eso podia acumular muchas consultas en
+    //cola al mismo tiempo si Mongo se ponia lento, contribuyendo al uso alto de memoria.
+    //bufferCommands:false hace que las consultas fallen de inmediato si no hay conexion,
+    //en vez de quedarse esperando y acumulandose.
+    bufferCommands: false,
+    //Limite de conexiones simultaneas que este proceso puede abrir hacia Atlas.
+    //Sin este limite, cada reinicio del servidor (por ejemplo durante el crash-loop
+    //que tuvimos) puede dejar conexiones abiertas sin cerrar correctamente, y con el
+    //tiempo acercarse al limite de conexiones del plan gratuito (M0) de Atlas.
+    maxPoolSize: 10,
+    //Si Atlas no responde en 10 segundos, se considera fallo en vez de esperar los 30 por defecto.
+    serverSelectionTimeoutMS: 10000,
+})
     .then(() => {
         //Si la conexion es exitosa, se mostrara el mensaje de conectado
         console.log('MongoDB conectado');
