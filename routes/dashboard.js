@@ -148,17 +148,35 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         //Aca es el inicio del mes
         const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
 
-        //Aca se obtienen las lecturas del día y del mes
-        const datosHoy = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: hoy } });
-        const datosMes = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } });
+        //Aca se obtienen las estadisticas del dia y del mes directamente desde MongoDB usando
+        //agregaciones ($group), en vez de traer TODOS los documentos a la memoria del servidor
+        //con Medicion.find(...). Antes, con miles de lecturas guardadas en el dia, cada consulta
+        //del dashboard (cada 3 segundos) cargaba esos miles de documentos completos en memoria,
+        //lo cual crecia sin control a medida que se acumulaban mas lecturas en el dia.
+        const [statsHoy] = await Medicion.aggregate([
+            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: hoy } } },
+            { $group: {
+                _id: null,
+                total_lecturas: { $sum: 1 },
+                promedio_caudal: { $avg: '$caudal_mLmin' },
+                maximo_caudal: { $max: '$caudal_mLmin' },
+                minimo_caudal: { $min: '$caudal_mLmin' },
+            } },
+        ]);
+        const [statsMes] = await Medicion.aggregate([
+            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } } },
+            { $group: {
+                _id: null,
+                total_lecturas: { $sum: 1 },
+                maximo_caudal: { $max: '$caudal_mLmin' },
+            } },
+        ]);
 
-        //Aca se calculan las estadísticas de caudal para hoy y el mes
-        const caudalesHoy = datosHoy.map(d => d.caudal_mLmin || 0);
-        const promedioHoy = caudalesHoy.length
-            ? (caudalesHoy.reduce((a, b) => a + b, 0) / caudalesHoy.length).toFixed(1) : 0;
-        const maximoHoy = caudalesHoy.length ? Math.max(...caudalesHoy).toFixed(1) : 0;
-        const minimoHoy = caudalesHoy.length ? Math.min(...caudalesHoy).toFixed(1) : 0;
-        const maximoMes = datosMes.length ? Math.max(...datosMes.map(d => d.caudal_mLmin || 0)).toFixed(1) : 0;
+        //Aca se calculan las estadísticas de caudal para hoy y el mes, ya calculadas por MongoDB
+        const promedioHoy = statsHoy ? (statsHoy.promedio_caudal || 0).toFixed(1) : 0;
+        const maximoHoy = statsHoy ? (statsHoy.maximo_caudal || 0).toFixed(1) : 0;
+        const minimoHoy = statsHoy ? (statsHoy.minimo_caudal || 0).toFixed(1) : 0;
+        const maximoMes = statsMes ? (statsMes.maximo_caudal || 0).toFixed(1) : 0;
 
         //Aca se obtienen todos los actuadores que estan registrados en la base de datos
         const actuadores = await Actuador.find();
@@ -216,7 +234,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
             stats: {
                 daily: {
                     //Número de lecturas registradas hoy 
-                    total_lecturas: datosHoy.length,
+                    total_lecturas: statsHoy ? statsHoy.total_lecturas : 0,
                     //Aca dice el promedio del caudal hoy
                     promedio_caudal: promedioHoy,
                     //Cual fue el caudal máximo registrado hoy
@@ -226,7 +244,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
                 },
                 monthly: {
                     //Número de lecturas registradas en el mes
-                    total_lecturas: datosMes.length,
+                    total_lecturas: statsMes ? statsMes.total_lecturas : 0,
                     //Caudal máximo registrados en el mes 
                     maximo_caudal: maximoMes,
                 },
