@@ -126,15 +126,6 @@ function iniciarIngesta() {
             return;
         }
 
-        //IMPORTANTE: como usamos un broker publico compartido (broker.hivemq.com),
-        //cualquier otro proyecto en el mundo con un topic parecido puede enviarnos mensajes.
-        //Aca se descarta cualquier mensaje cuyo sensor_id no sea uno de los nuestros,
-        //ANTES de tocar la base de datos, para no procesar trafico ajeno.
-        const SENSORES_VALIDOS = ['sensor_01', 'sensor_02', 'sensor_03'];
-        if (!SENSORES_VALIDOS.includes(datos.sensor_id)) {
-            return;
-        }
-
         try {
             //Aca se guardan la lectura de  los sensores en la base de datos en MOngoDb
             await Medicion.create({

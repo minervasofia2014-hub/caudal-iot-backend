@@ -3,7 +3,7 @@ const express = require('express');
 //Se crea un "router", esto lo que hace es utilizar un mini-servidor dentro de Express para organizar las rutas
 const router = express.Router();
 //Se importa la función "verificarToken", esto asegura que solo los usuarios autenticados accedan a estas rutas
-const { verificarToken } = require('./auth');
+const { verificarToken, verificarAdmin } = require('./auth');
 //Importamos la conexion del MQTT, que nos permite enviar comandos a los dispositivos
 const conexionMqtt = require('../mqtt/mqttCliente');
 //También se importan los modelos que vamos a usar ya que podemos usarlos como:
@@ -11,6 +11,8 @@ const conexionMqtt = require('../mqtt/mqttCliente');
 const Medicion = require('../modelos/Medicion');
 const Actuador = require('../modelos/Actuador');
 const Alerta = require('../modelos/Alerta');
+//Modelo que guarda el "punto cero" cuando un administrador reinicia el sistema
+const Reinicio = require('../modelos/Reinicio');
 
 //Aca se definen los topics de MQTT para cada electroválvulas (pero cada electoválvula tiene su canal de comunicación)
 const TOPICS_VALVULA = {
@@ -112,12 +114,76 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         const [sensor03] = await Medicion.find({ sensor_id: 'sensor_03' }).sort({ createdAt: -1 }).limit(1);
         //Aca solo se obtienen las 100 últimas lecturas que se mostraran en el dashboard
         const recientes = await Medicion.find().sort({ createdAt: -1 }).limit(100);
+        //Aca se trae el último reinicio para saber desde qué valor mostrar el acumulado en 0
+        const ultimoReinicio = await Reinicio.findOne().sort({ createdAt: -1 });
+        const off1 = ultimoReinicio?.offset_s1 || 0;
+        const off2 = ultimoReinicio?.offset_s2 || 0;
+        const off3 = ultimoReinicio?.offset_s3 || 0;
+        const offPorSensor = { sensor_01: off1, sensor_02: off2, sensor_03: off3 };
+        //Resta el punto cero al total del ESP32. Si el ESP32 se reinició (total < offset),
+        //muestra el total tal cual para que se recupere solo.
+        const ajustarTotal = (total, off) => {
+            total = total || 0;
+            return total < off ? total : total - off;
+        };
+
         //Aca se calcula los caudales de entrada y salida  
         const caudal01 = sensor01?.caudal_mLmin || 0;
         const caudal02 = sensor02?.caudal_mLmin || 0;
         const caudal03 = sensor03?.caudal_mLmin || 0;
         const totalSalida = caudal02 + caudal03;
         const perdida = Math.max(0, caudal01 - totalSalida);
+
+        // ===== Balance por VOLUMEN acumulado sobre una ventana de tiempo =====
+        // En vez de comparar el caudal instantáneo (la "foto" de la última lectura, que
+        // llega en momentos distintos por cada sensor), comparamos cuánto volumen real
+        // (total_mL) pasó por cada sensor durante la MISMA ventana. Así desaparecen las
+        // pérdidas fantasma del arranque y de las lecturas no simultáneas.
+        const VENTANA_MIN = 5; // minutos de ventana para el balance
+        const desdeVentana = new Date(Date.now() - VENTANA_MIN * 60 * 1000);
+
+        // Devuelve el volumen (mL) y el caudal promedio (mL/min) de un sensor en la ventana
+        async function volumenVentana(sensorId) {
+            // Primera lectura dentro de la ventana y última lectura registrada
+            const [primero] = await Medicion.find({ sensor_id: sensorId, createdAt: { $gte: desdeVentana } })
+                .sort({ createdAt: 1 }).limit(1);
+            const [ultimo] = await Medicion.find({ sensor_id: sensorId })
+                .sort({ createdAt: -1 }).limit(1);
+            if (!primero || !ultimo) return { volumen: 0, minutos: 0, caudal: 0 };
+
+            let volumen = (ultimo.total_mL || 0) - (primero.total_mL || 0);
+            // Si el ESP32 se reinició, total_mL vuelve a 0 y la resta da negativo:
+            // en ese caso usamos el acumulado actual como mejor aproximación.
+            if (volumen < 0) volumen = ultimo.total_mL || 0;
+
+            const minutos = (ultimo.createdAt.getTime() - primero.createdAt.getTime()) / 60000;
+            const caudal = minutos > 0.1 ? volumen / minutos : 0;
+            return { volumen, minutos, caudal };
+        }
+
+        const vent01 = await volumenVentana('sensor_01');
+        const vent02 = await volumenVentana('sensor_02');
+        const vent03 = await volumenVentana('sensor_03');
+
+        const entradaProm = vent01.caudal;
+        const salidaProm = vent02.caudal + vent03.caudal;
+        const perdidaProm = Math.max(0, entradaProm - salidaProm);
+        const eficienciaProm = entradaProm > 0
+            ? Math.min(100, (salidaProm / entradaProm) * 100)
+            : 100;
+
+        const balance = {
+            ventana_min: VENTANA_MIN,
+            // Caudales PROMEDIO en la ventana (mL/min), calculados con volumen real
+            entrada_prom: Number(entradaProm.toFixed(1)),
+            salida1_prom: Number(vent02.caudal.toFixed(1)),
+            salida2_prom: Number(vent03.caudal.toFixed(1)),
+            perdida_prom: Number(perdidaProm.toFixed(1)),
+            eficiencia_prom: Number(eficienciaProm.toFixed(1)),
+            // Volúmenes reales acumulados en la ventana (mL), por si se quieren mostrar
+            volumen_entrada: Number(vent01.volumen.toFixed(1)),
+            volumen_salida: Number((vent02.volumen + vent03.volumen).toFixed(1)),
+        };
 
         //Aca se determina el estado del sistema según las lecturas
         let estado = 'desconectado';
@@ -148,40 +214,24 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         //Aca es el inicio del mes
         const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
 
-        //Aca se obtienen las estadisticas del dia y del mes directamente desde MongoDB usando
-        //agregaciones ($group), en vez de traer TODOS los documentos a la memoria del servidor
-        //con Medicion.find(...). Antes, con miles de lecturas guardadas en el dia, cada consulta
-        //del dashboard (cada 3 segundos) cargaba esos miles de documentos completos en memoria,
-        //lo cual crecia sin control a medida que se acumulaban mas lecturas en el dia.
-        const [statsHoy] = await Medicion.aggregate([
-            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: hoy } } },
-            { $group: {
-                _id: null,
-                total_lecturas: { $sum: 1 },
-                promedio_caudal: { $avg: '$caudal_mLmin' },
-                maximo_caudal: { $max: '$caudal_mLmin' },
-                minimo_caudal: { $min: '$caudal_mLmin' },
-            } },
-        ]);
-        const [statsMes] = await Medicion.aggregate([
-            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } } },
-            { $group: {
-                _id: null,
-                total_lecturas: { $sum: 1 },
-                maximo_caudal: { $max: '$caudal_mLmin' },
-            } },
-        ]);
+        //Aca se obtienen las lecturas del día y del mes
+        const datosHoy = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: hoy } });
+        const datosMes = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } });
 
-        //Aca se calculan las estadísticas de caudal para hoy y el mes, ya calculadas por MongoDB
-        const promedioHoy = statsHoy ? (statsHoy.promedio_caudal || 0).toFixed(1) : 0;
-        const maximoHoy = statsHoy ? (statsHoy.maximo_caudal || 0).toFixed(1) : 0;
-        const minimoHoy = statsHoy ? (statsHoy.minimo_caudal || 0).toFixed(1) : 0;
-        const maximoMes = statsMes ? (statsMes.maximo_caudal || 0).toFixed(1) : 0;
+        //Aca se calculan las estadísticas de caudal para hoy y el mes
+        const caudalesHoy = datosHoy.map(d => d.caudal_mLmin || 0);
+        const promedioHoy = caudalesHoy.length
+            ? (caudalesHoy.reduce((a, b) => a + b, 0) / caudalesHoy.length).toFixed(1) : 0;
+        const maximoHoy = caudalesHoy.length ? Math.max(...caudalesHoy).toFixed(1) : 0;
+        const minimoHoy = caudalesHoy.length ? Math.min(...caudalesHoy).toFixed(1) : 0;
+        const maximoMes = datosMes.length ? Math.max(...datosMes.map(d => d.caudal_mLmin || 0)).toFixed(1) : 0;
 
         //Aca se obtienen todos los actuadores que estan registrados en la base de datos
         const actuadores = await Actuador.find();
         //Aca se responde al cliente con un objeto JSON que contiene toda la información del dashboard
         res.json({
+            //Balance hídrico calculado por volumen real acumulado en una ventana de tiempo
+            balance,
             //Aca esta la sección con la última lectura del sensor principal y sus datos derivados
             latest: {
                 reading: {
@@ -193,12 +243,12 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
                     caudal_s2: caudal02,
                     //Caudal del ramal 3
                     caudal_s3: caudal03,
-                    //Aca es el volumen acumulado en el sensor 1
-                    total_s1: sensor01?.total_mL || 0,
-                    //Aca es el volumen acumulado en el sensor 2
-                    total_s2: sensor02?.total_mL || 0,
-                    //Aca es el volumen acumulado en el sensor 3
-                    total_s3: sensor03?.total_mL || 0,
+                    //Aca es el volumen acumulado en el sensor 1 (descontando el punto de reinicio)
+                    total_s1: ajustarTotal(sensor01?.total_mL, off1),
+                    //Aca es el volumen acumulado en el sensor 2 (descontando el punto de reinicio)
+                    total_s2: ajustarTotal(sensor02?.total_mL, off2),
+                    //Aca es el volumen acumulado en el sensor 3 (descontando el punto de reinicio)
+                    total_s3: ajustarTotal(sensor03?.total_mL, off3),
                     //Aca es la diferencia entre la entrada y salida del caudal una posible fuga debe tener
                     perdida,
                     //Fecha de la última lectura del sensor 1 
@@ -221,8 +271,8 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
                 sensor_id: d.sensor_id,
                 //Caudal medido en esta lectura
                 caudal_entrada: d.caudal_mLmin || 0,
-                //Volumen acumulado hasta esta lectura 
-                total_mL: d.total_mL || 0,
+                //Volumen acumulado hasta esta lectura (descontando el punto de reinicio)
+                total_mL: ajustarTotal(d.total_mL, offPorSensor[d.sensor_id] || 0),
                 //Fecha registrada por el ESP32 o por la base de datos
                 fecha: d.fecha_esp32 || d.createdAt,
                 //Estado general del sistema en este momento 
@@ -234,7 +284,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
             stats: {
                 daily: {
                     //Número de lecturas registradas hoy 
-                    total_lecturas: statsHoy ? statsHoy.total_lecturas : 0,
+                    total_lecturas: datosHoy.length,
                     //Aca dice el promedio del caudal hoy
                     promedio_caudal: promedioHoy,
                     //Cual fue el caudal máximo registrado hoy
@@ -244,7 +294,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
                 },
                 monthly: {
                     //Número de lecturas registradas en el mes
-                    total_lecturas: statsMes ? statsMes.total_lecturas : 0,
+                    total_lecturas: datosMes.length,
                     //Caudal máximo registrados en el mes 
                     maximo_caudal: maximoMes,
                 },
@@ -256,6 +306,42 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         });
     } catch (err) {
         //Si ocurre un error se devolvera un mensaje con el detalle del error 
+        res.status(500).json({ detail: err.message });
+    }
+});
+
+//Aca se crea la ruta "POST /reiniciar/" para poner los 3 sensores en 0 (SOLO administradores).
+//Como no tocamos el firmware del ESP32 (él sigue contando), guardamos el total_mL actual de
+//cada sensor como "punto cero" y de ahí en adelante el dashboard muestra el acumulado desde 0.
+//También se borra el historial de mediciones para que las gráficas y la tabla arranquen limpias.
+router.post('/reiniciar/', verificarToken, verificarAdmin, async (req, res) => {
+    try {
+        //Aca se toma la última lectura de cada sensor para saber en cuánto va su contador
+        const [s1] = await Medicion.find({ sensor_id: 'sensor_01' }).sort({ createdAt: -1 }).limit(1);
+        const [s2] = await Medicion.find({ sensor_id: 'sensor_02' }).sort({ createdAt: -1 }).limit(1);
+        const [s3] = await Medicion.find({ sensor_id: 'sensor_03' }).sort({ createdAt: -1 }).limit(1);
+
+        //Aca se guarda el punto cero (offset) de cada sensor
+        await Reinicio.create({
+            offset_s1: s1?.total_mL || 0,
+            offset_s2: s2?.total_mL || 0,
+            offset_s3: s3?.total_mL || 0,
+            reiniciado_por: req.usuario?.usuario || '',
+        });
+
+        //Aca se borra el historial de mediciones para empezar de cero (gráficas y tabla)
+        await Medicion.deleteMany({});
+
+        //Aca se cierran las alertas que estuvieran activas
+        await Alerta.updateMany(
+            { solucionada_alerta: false },
+            { $set: { solucionada_alerta: true, fecha_solucion_alerta: new Date() } }
+        );
+
+        //Aca se responde confirmando el reinicio
+        res.json({ detail: 'Sistema reiniciado. Los 3 sensores vuelven a 0.' });
+    } catch (err) {
+        //Si ocurre un error se devuelve el detalle
         res.status(500).json({ detail: err.message });
     }
 });

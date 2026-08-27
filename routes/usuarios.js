@@ -23,6 +23,20 @@ router.get('/', verificarToken, verificarAdmin, async (req, res) => {
     }
 });
 
+//Aca se hace la ruta "GET /mapa" que devuelve solo lo necesario para pintar a los usuarios
+//en el mapa (nombre, si está activo y sus coordenadas). Cualquier usuario autenticado puede verla.
+router.get('/mapa', verificarToken, async (req, res) => {
+    try {
+        //Se traen solo campos públicos (nunca la contraseña ni el correo)
+        const usuarios = await Usuario.find()
+            .select('usuario nombre apellido esta_activo latitud longitud')
+            .sort({ createdAt: -1 });
+        res.json(usuarios);
+    } catch (err) {
+        res.status(500).json({ detail: err.message });
+    }
+});
+
 //Aca se hace es la ruta de "POST" que este es para crear nuevos usuarios (solo los administradores)
 router.post('/', verificarToken, verificarAdmin, async (req, res) => {
     try {
@@ -57,9 +71,13 @@ router.post('/', verificarToken, verificarAdmin, async (req, res) => {
 router.put('/:id', verificarToken, verificarAdmin, async (req, res) => {
     try {
         //Aca se extrae los datos enviados en el cuerpo de la petición 
-        const { usuario, contraseña, correo_electronico, nombre, apellido, es_administrador, esta_activo } = req.body;
+        const { usuario, contraseña, correo_electronico, nombre, apellido, es_administrador, esta_activo, latitud, longitud } = req.body;
         //Aca se crea un objeto con los datos actualizados
         const datosActualizados = { usuario, correo_electronico, nombre, apellido, es_administrador, esta_activo };
+
+        //Coordenadas para el mapa: si vienen vacías se guardan como null, si no como número
+        if (latitud !== undefined) datosActualizados.latitud = (latitud === '' || latitud === null) ? null : Number(latitud);
+        if (longitud !== undefined) datosActualizados.longitud = (longitud === '' || longitud === null) ? null : Number(longitud);
 
         //Si se envio una nueva contraseña, se encripta antes de guardarla
         if (contraseña) {

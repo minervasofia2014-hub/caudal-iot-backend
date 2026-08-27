@@ -18,7 +18,11 @@ const esquemaUsuario = new mongoose.Schema({
     es_administrador: { type: Boolean, default: false },
     //Aca se sabe si la cuenta esta activa o inactiva para ser parte del sistema del acueducto veredal solo el administrador
     //puede dar ingreso
-    esta_activo: { type: Boolean, default: false }
+    esta_activo: { type: Boolean, default: false },
+    //Coordenadas opcionales del usuario para ubicarlo en el mapa. Si quedan en null,
+    //el frontend le asigna una posición estable cerca de la vereda a partir de su nombre.
+    latitud: { type: Number, default: null },
+    longitud: { type: Number, default: null }
     //MongoDb agraga el tiempo real de cada creación o eliminacion de cada usuario 
 }, {timestamps: true });
 
