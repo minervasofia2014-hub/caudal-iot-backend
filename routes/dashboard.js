@@ -109,11 +109,11 @@ router.get('/alertas/', verificarToken, async (req, res) => {
 router.get('/dashboard/', verificarToken, async (req, res) => {
     try {
         //Aca se obtienen las úlyimas lecturas de cada sensor 
-        const [sensor01] = await Medicion.find({ sensor_id: 'sensor_01' }).sort({ createdAt: -1 }).limit(1);
-        const [sensor02] = await Medicion.find({ sensor_id: 'sensor_02' }).sort({ createdAt: -1 }).limit(1);
-        const [sensor03] = await Medicion.find({ sensor_id: 'sensor_03' }).sort({ createdAt: -1 }).limit(1);
+        const [sensor01] = await Medicion.find({ sensor_id: 'sensor_01' }).select('total_mL caudal_mLmin fecha_esp32 createdAt').sort({ createdAt: -1 }).limit(1).lean();
+        const [sensor02] = await Medicion.find({ sensor_id: 'sensor_02' }).select('total_mL caudal_mLmin fecha_esp32 createdAt').sort({ createdAt: -1 }).limit(1).lean();
+        const [sensor03] = await Medicion.find({ sensor_id: 'sensor_03' }).select('total_mL caudal_mLmin fecha_esp32 createdAt').sort({ createdAt: -1 }).limit(1).lean();
         //Aca solo se obtienen las 100 últimas lecturas que se mostraran en el dashboard
-        const recientes = await Medicion.find().sort({ createdAt: -1 }).limit(100);
+        const recientes = await Medicion.find().select('sensor_id caudal_mLmin total_mL fecha_esp32 createdAt origen_dato').sort({ createdAt: -1 }).limit(100).lean();
         //Aca se trae el último reinicio para saber desde qué valor mostrar el acumulado en 0
         const ultimoReinicio = await Reinicio.findOne().sort({ createdAt: -1 });
         const off1 = ultimoReinicio?.offset_s1 || 0;
@@ -146,9 +146,9 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         async function volumenVentana(sensorId) {
             // Primera lectura dentro de la ventana y última lectura registrada
             const [primero] = await Medicion.find({ sensor_id: sensorId, createdAt: { $gte: desdeVentana } })
-                .sort({ createdAt: 1 }).limit(1);
+                .select('total_mL createdAt').sort({ createdAt: 1 }).limit(1).lean();
             const [ultimo] = await Medicion.find({ sensor_id: sensorId })
-                .sort({ createdAt: -1 }).limit(1);
+                .select('total_mL createdAt').sort({ createdAt: -1 }).limit(1).lean();
             if (!primero || !ultimo) return { volumen: 0, minutos: 0, caudal: 0 };
 
             let volumen = (ultimo.total_mL || 0) - (primero.total_mL || 0);
@@ -214,17 +214,24 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         //Aca es el inicio del mes
         const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
 
-        //Aca se obtienen las lecturas del día y del mes
-        const datosHoy = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: hoy } });
-        const datosMes = await Medicion.find({ sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } });
+        //Aca se calculan las estadísticas del día y del mes con AGREGACIÓN en MongoDB.
+        //Así el cálculo (contar, promedio, máximo, mínimo) lo hace la base de datos y NO se
+        //traen miles de documentos a la memoria de Node (eso era lo que tumbaba el servidor).
+        const [aggHoy] = await Medicion.aggregate([
+            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: hoy } } },
+            { $group: { _id: null, total: { $sum: 1 }, promedio: { $avg: '$caudal_mLmin' }, maximo: { $max: '$caudal_mLmin' }, minimo: { $min: '$caudal_mLmin' } } }
+        ]);
+        const [aggMes] = await Medicion.aggregate([
+            { $match: { sensor_id: 'sensor_01', createdAt: { $gte: inicioMes } } },
+            { $group: { _id: null, total: { $sum: 1 }, maximo: { $max: '$caudal_mLmin' } } }
+        ]);
 
-        //Aca se calculan las estadísticas de caudal para hoy y el mes
-        const caudalesHoy = datosHoy.map(d => d.caudal_mLmin || 0);
-        const promedioHoy = caudalesHoy.length
-            ? (caudalesHoy.reduce((a, b) => a + b, 0) / caudalesHoy.length).toFixed(1) : 0;
-        const maximoHoy = caudalesHoy.length ? Math.max(...caudalesHoy).toFixed(1) : 0;
-        const minimoHoy = caudalesHoy.length ? Math.min(...caudalesHoy).toFixed(1) : 0;
-        const maximoMes = datosMes.length ? Math.max(...datosMes.map(d => d.caudal_mLmin || 0)).toFixed(1) : 0;
+        const totalLecturasHoy = aggHoy?.total || 0;
+        const promedioHoy = aggHoy ? (aggHoy.promedio || 0).toFixed(1) : 0;
+        const maximoHoy = aggHoy ? (aggHoy.maximo || 0).toFixed(1) : 0;
+        const minimoHoy = aggHoy ? (aggHoy.minimo || 0).toFixed(1) : 0;
+        const totalLecturasMes = aggMes?.total || 0;
+        const maximoMes = aggMes ? (aggMes.maximo || 0).toFixed(1) : 0;
 
         //Aca se obtienen todos los actuadores que estan registrados en la base de datos
         const actuadores = await Actuador.find();
@@ -284,7 +291,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
             stats: {
                 daily: {
                     //Número de lecturas registradas hoy 
-                    total_lecturas: datosHoy.length,
+                    total_lecturas: totalLecturasHoy,
                     //Aca dice el promedio del caudal hoy
                     promedio_caudal: promedioHoy,
                     //Cual fue el caudal máximo registrado hoy
@@ -294,7 +301,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
                 },
                 monthly: {
                     //Número de lecturas registradas en el mes
-                    total_lecturas: datosMes.length,
+                    total_lecturas: totalLecturasMes,
                     //Caudal máximo registrados en el mes 
                     maximo_caudal: maximoMes,
                 },
@@ -317,9 +324,9 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
 router.post('/reiniciar/', verificarToken, verificarAdmin, async (req, res) => {
     try {
         //Aca se toma la última lectura de cada sensor para saber en cuánto va su contador
-        const [s1] = await Medicion.find({ sensor_id: 'sensor_01' }).sort({ createdAt: -1 }).limit(1);
-        const [s2] = await Medicion.find({ sensor_id: 'sensor_02' }).sort({ createdAt: -1 }).limit(1);
-        const [s3] = await Medicion.find({ sensor_id: 'sensor_03' }).sort({ createdAt: -1 }).limit(1);
+        const [s1] = await Medicion.find({ sensor_id: 'sensor_01' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
+        const [s2] = await Medicion.find({ sensor_id: 'sensor_02' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
+        const [s3] = await Medicion.find({ sensor_id: 'sensor_03' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
 
         //Aca se guarda el punto cero (offset) de cada sensor
         await Reinicio.create({
