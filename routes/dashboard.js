@@ -140,14 +140,29 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         // (total_mL) pasó por cada sensor durante la MISMA ventana. Así desaparecen las
         // pérdidas fantasma del arranque y de las lecturas no simultáneas.
         const VENTANA_MIN = 5; // minutos de ventana para el balance
-        const desdeVentana = new Date(Date.now() - VENTANA_MIN * 60 * 1000);
 
-        // Devuelve el volumen (mL) y el caudal promedio (mL/min) de un sensor en la ventana
+        // ---- SINCRONIZACIÓN: los tres sensores se miden en el MISMO instante ----
+        // Antes cada sensor terminaba en su propia última lectura (llegaban desfasadas
+        // por unos segundos). Ahora fijamos un punto final COMÚN (tFin) que es la última
+        // lectura que los TRES sensores ya alcanzaron, y medimos a todos en la misma
+        // ventana [tInicio, tFin]. Así las tres marcaciones corresponden al mismo periodo.
+        async function ultimaFecha(sensorId) {
+            const [u] = await Medicion.find({ sensor_id: sensorId })
+                .select('createdAt').sort({ createdAt: -1 }).limit(1).lean();
+            return u ? u.createdAt.getTime() : null;
+        }
+        const finesSensores = (await Promise.all(
+            ['sensor_01', 'sensor_02', 'sensor_03'].map(ultimaFecha)
+        )).filter(v => v !== null);
+        // el más antiguo de las últimas lecturas -> punto donde los tres ya tienen dato
+        const tFin = finesSensores.length ? Math.min(...finesSensores) : Date.now();
+        const tInicio = tFin - VENTANA_MIN * 60 * 1000;
+
+        // Volumen (mL) y caudal promedio (mL/min) de un sensor DENTRO de la ventana común
         async function volumenVentana(sensorId) {
-            // Primera lectura dentro de la ventana y última lectura registrada
-            const [primero] = await Medicion.find({ sensor_id: sensorId, createdAt: { $gte: desdeVentana } })
+            const [primero] = await Medicion.find({ sensor_id: sensorId, createdAt: { $gte: new Date(tInicio) } })
                 .select('total_mL createdAt').sort({ createdAt: 1 }).limit(1).lean();
-            const [ultimo] = await Medicion.find({ sensor_id: sensorId })
+            const [ultimo] = await Medicion.find({ sensor_id: sensorId, createdAt: { $lte: new Date(tFin) } })
                 .select('total_mL createdAt').sort({ createdAt: -1 }).limit(1).lean();
             if (!primero || !ultimo) return { volumen: 0, minutos: 0, caudal: 0 };
 
@@ -324,16 +339,32 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
 router.post('/reiniciar/', verificarToken, verificarAdmin, async (req, res) => {
     try {
         //Aca se toma la última lectura de cada sensor para saber en cuánto va su contador
-        const [s1] = await Medicion.find({ sensor_id: 'sensor_01' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
-        const [s2] = await Medicion.find({ sensor_id: 'sensor_02' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
-        const [s3] = await Medicion.find({ sensor_id: 'sensor_03' }).select('total_mL').sort({ createdAt: -1 }).limit(1).lean();
+        //y de paso guardar la "foto" historica (total mostrado y ultimo caudal).
+        const [s1] = await Medicion.find({ sensor_id: 'sensor_01' }).select('total_mL caudal_mLmin').sort({ createdAt: -1 }).limit(1).lean();
+        const [s2] = await Medicion.find({ sensor_id: 'sensor_02' }).select('total_mL caudal_mLmin').sort({ createdAt: -1 }).limit(1).lean();
+        const [s3] = await Medicion.find({ sensor_id: 'sensor_03' }).select('total_mL caudal_mLmin').sort({ createdAt: -1 }).limit(1).lean();
 
-        //Aca se guarda el punto cero (offset) de cada sensor
+        //Descuento del reinicio anterior, para guardar el total tal como se veia en pantalla
+        const rPrevio = await Reinicio.findOne().sort({ createdAt: -1 });
+        const oPrev1 = rPrevio?.offset_s1 || 0;
+        const oPrev2 = rPrevio?.offset_s2 || 0;
+        const oPrev3 = rPrevio?.offset_s3 || 0;
+        const mostrado = (total, off) => { total = total || 0; return total < off ? total : total - off; };
+
+        //Aca se guarda el punto cero (offset) de cada sensor + el REGISTRO HISTORICO
+        //de como quedo el sistema justo antes de reiniciar.
         await Reinicio.create({
             offset_s1: s1?.total_mL || 0,
             offset_s2: s2?.total_mL || 0,
             offset_s3: s3?.total_mL || 0,
             reiniciado_por: req.usuario?.usuario || '',
+            //foto historica: volumen que se veia en pantalla y ultimo caudal
+            historico_total_s1: mostrado(s1?.total_mL, oPrev1),
+            historico_total_s2: mostrado(s2?.total_mL, oPrev2),
+            historico_total_s3: mostrado(s3?.total_mL, oPrev3),
+            historico_caudal_s1: s1?.caudal_mLmin || 0,
+            historico_caudal_s2: s2?.caudal_mLmin || 0,
+            historico_caudal_s3: s3?.caudal_mLmin || 0,
         });
 
         //Aca se borra el historial de mediciones para empezar de cero (gráficas y tabla)
