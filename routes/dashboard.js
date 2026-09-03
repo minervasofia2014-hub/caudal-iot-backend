@@ -141,7 +141,7 @@ router.get('/dashboard/', verificarToken, async (req, res) => {
         // llega en momentos distintos por cada sensor), comparamos cuánto volumen real
         // (total_mL) pasó por cada sensor durante la MISMA ventana. Así desaparecen las
         // pérdidas fantasma del arranque y de las lecturas no simultáneas.
-        const VENTANA_MIN = 5; // minutos de ventana para el balance
+        const VENTANA_MIN = 2; // minutos de ventana para el balance (más reactivo)
 
         // ---- SINCRONIZACIÓN: los tres sensores se miden en el MISMO instante ----
         // Antes cada sensor terminaba en su propia última lectura (llegaban desfasadas
@@ -390,10 +390,10 @@ router.post('/reiniciar/', verificarToken, verificarAdmin, async (req, res) => {
 //promedio agrupado por SEMANA o por MES (según ?rango=semanal|mensual).
 router.get('/historial/', verificarToken, async (req, res) => {
     try {
-        //Por defecto semanal; si piden mensual, se agrupa por mes
-        const rango = req.query.rango === 'mensual' ? 'mensual' : 'semanal';
-        //Formato de agrupación: mes (YYYY-MM) o semana ISO (YYYY-Sxx)
-        const formato = rango === 'mensual' ? '%Y-%m' : '%G-S%V';
+        //Por defecto semanal; puede ser diario o mensual
+        const rango = req.query.rango === 'mensual' ? 'mensual' : (req.query.rango === 'diario' ? 'diario' : 'semanal');
+        //Formato de agrupación: día (YYYY-MM-DD), mes (YYYY-MM) o semana ISO (YYYY-Sxx)
+        const formato = rango === 'mensual' ? '%Y-%m' : (rango === 'diario' ? '%Y-%m-%d' : '%G-S%V');
 
         //Se agrupa el historial por sensor y por periodo, promediando los bloques
         const datos = await HistorialCaudal.aggregate([
