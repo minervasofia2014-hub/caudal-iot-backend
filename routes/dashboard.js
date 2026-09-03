@@ -13,6 +13,8 @@ const Actuador = require('../modelos/Actuador');
 const Alerta = require('../modelos/Alerta');
 //Modelo que guarda el "punto cero" cuando un administrador reinicia el sistema
 const Reinicio = require('../modelos/Reinicio');
+//Modelo del historial resumido (promedios por bloque)
+const HistorialCaudal = require('../modelos/HistorialCaudal');
 
 //Aca se definen los topics de MQTT para cada electroválvulas (pero cada electoválvula tiene su canal de comunicación)
 const TOPICS_VALVULA = {
@@ -380,6 +382,62 @@ router.post('/reiniciar/', verificarToken, verificarAdmin, async (req, res) => {
         res.json({ detail: 'Sistema reiniciado. Los 3 sensores vuelven a 0.' });
     } catch (err) {
         //Si ocurre un error se devuelve el detalle
+        res.status(500).json({ detail: err.message });
+    }
+});
+
+//Aca se crea la ruta "GET /historial/" que devuelve el historial de caudal
+//promedio agrupado por SEMANA o por MES (según ?rango=semanal|mensual).
+router.get('/historial/', verificarToken, async (req, res) => {
+    try {
+        //Por defecto semanal; si piden mensual, se agrupa por mes
+        const rango = req.query.rango === 'mensual' ? 'mensual' : 'semanal';
+        //Formato de agrupación: mes (YYYY-MM) o semana ISO (YYYY-Sxx)
+        const formato = rango === 'mensual' ? '%Y-%m' : '%G-S%V';
+
+        //Se agrupa el historial por sensor y por periodo, promediando los bloques
+        const datos = await HistorialCaudal.aggregate([
+            { $group: {
+                _id: {
+                    sensor: '$sensor_id',
+                    periodo: { $dateToString: { format: formato, date: '$createdAt' } }
+                },
+                ubicacion: { $first: '$ubicacion' },
+                caudal_promedio: { $avg: '$caudal_promedio' },
+                bloques: { $sum: 1 }
+            }},
+            { $sort: { '_id.periodo': 1, '_id.sensor': 1 } }
+        ]);
+
+        //Se da forma sencilla a la respuesta
+        const salida = datos.map(d => ({
+            sensor_id: d._id.sensor,
+            ubicacion: d.ubicacion,
+            periodo: d._id.periodo,
+            caudal_promedio: Number((d.caudal_promedio || 0).toFixed(2)),
+            bloques: d.bloques
+        }));
+
+        res.json({ rango, datos: salida });
+    } catch (err) {
+        res.status(500).json({ detail: err.message });
+    }
+});
+
+//Aca se crea la ruta "GET /reinicios/" que devuelve el historial de reinicios
+//(cuándo se reinició, quién lo hizo y cómo estaba el sistema en ese momento).
+router.get('/reinicios/', verificarToken, async (req, res) => {
+    try {
+        const lista = await Reinicio.find().sort({ createdAt: -1 }).limit(30).lean();
+        const salida = lista.map(r => ({
+            fecha: r.createdAt,
+            reiniciado_por: r.reiniciado_por || 'desconocido',
+            total_s1: r.historico_total_s1 || 0,
+            total_s2: r.historico_total_s2 || 0,
+            total_s3: r.historico_total_s3 || 0,
+        }));
+        res.json({ datos: salida });
+    } catch (err) {
         res.status(500).json({ detail: err.message });
     }
 });

@@ -29,7 +29,7 @@ router.get('/mapa', verificarToken, async (req, res) => {
     try {
         //Se traen solo campos públicos (nunca la contraseña ni el correo)
         const usuarios = await Usuario.find()
-            .select('usuario nombre apellido esta_activo latitud longitud')
+            .select('usuario nombre apellido esta_activo latitud longitud sensor_asociado')
             .sort({ createdAt: -1 });
         res.json(usuarios);
     } catch (err) {
@@ -71,13 +71,14 @@ router.post('/', verificarToken, verificarAdmin, async (req, res) => {
 router.put('/:id', verificarToken, verificarAdmin, async (req, res) => {
     try {
         //Aca se extrae los datos enviados en el cuerpo de la petición 
-        const { usuario, contraseña, correo_electronico, nombre, apellido, es_administrador, esta_activo, latitud, longitud } = req.body;
+        const { usuario, contraseña, correo_electronico, nombre, apellido, es_administrador, esta_activo, latitud, longitud, sensor_asociado } = req.body;
         //Aca se crea un objeto con los datos actualizados
         const datosActualizados = { usuario, correo_electronico, nombre, apellido, es_administrador, esta_activo };
 
         //Coordenadas para el mapa: si vienen vacías se guardan como null, si no como número
         if (latitud !== undefined) datosActualizados.latitud = (latitud === '' || latitud === null) ? null : Number(latitud);
         if (longitud !== undefined) datosActualizados.longitud = (longitud === '' || longitud === null) ? null : Number(longitud);
+        if (sensor_asociado !== undefined) datosActualizados.sensor_asociado = sensor_asociado || '';
 
         //Si se envio una nueva contraseña, se encripta antes de guardarla
         if (contraseña) {

@@ -22,7 +22,10 @@ const esquemaUsuario = new mongoose.Schema({
     //Coordenadas opcionales del usuario para ubicarlo en el mapa. Si quedan en null,
     //el frontend le asigna una posición estable cerca de la vereda a partir de su nombre.
     latitud: { type: Number, default: null },
-    longitud: { type: Number, default: null }
+    longitud: { type: Number, default: null },
+    //Sensor/punto de medición al que pertenece el usuario (sensor_01/02/03).
+    //Sirve para que al pulsar el usuario en el mapa se vea la gráfica de ese punto.
+    sensor_asociado: { type: String, default: '' }
     //MongoDb agraga el tiempo real de cada creación o eliminacion de cada usuario 
 }, {timestamps: true });
 

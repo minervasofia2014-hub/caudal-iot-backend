@@ -5,6 +5,17 @@ const conexionMqtt = require('./mqttCliente');
 const Medicion = require('../modelos/Medicion');
 const Actuador = require('../modelos/Actuador');
 const Alerta = require('../modelos/Alerta');
+//Modelo del historial resumido (promedios por bloque)
+const HistorialCaudal = require('../modelos/HistorialCaudal');
+
+//Cada cuántas lecturas de un sensor se promedia y se archiva un bloque
+const BLOQUE_HISTORIAL = 100;
+//Cuántas lecturas recientes se CONSERVAN sin borrar (las necesita el balance
+//en vivo de los últimos 5 min). Con 100, el balance nunca se queda sin datos.
+//Si quieres borrar exactamente las 100 al promediar, pon BUFFER_RECIENTES = 0.
+const BUFFER_RECIENTES = 100;
+//Evita que dos mensajes casi simultáneos disparen el mismo archivado
+const archivadoEnCurso = {};
 
 //Aca se define el tema (topic) de MQTT que vamos a llamar 
 //El simbolo "+" en MQTT es un comodín ya que puede capturar cualquier tema de un nivel,
@@ -101,6 +112,52 @@ async function evaluarFuga() {
     }
 }
 
+//Aca se archiva el historial: cuando un sensor acumula suficientes lecturas,
+//se promedia el bloque más antiguo de 100, se guarda ese promedio y se borran
+//esas 100 lecturas crudas de la colección de mediciones.
+async function acumularHistorial(sensorId, ubicacion) {
+    //Si ya hay un archivado en curso para este sensor, no se repite
+    if (archivadoEnCurso[sensorId]) return;
+    try {
+        //Cuántas lecturas crudas hay de este sensor
+        const total = await Medicion.countDocuments({ sensor_id: sensorId });
+        //Solo se archiva cuando hay al menos un bloque completo + el buffer reciente
+        if (total < BLOQUE_HISTORIAL + BUFFER_RECIENTES) return;
+
+        archivadoEnCurso[sensorId] = true;
+
+        //Se toman las 100 lecturas MÁS ANTIGUAS (las que ya se pueden archivar)
+        const lote = await Medicion.find({ sensor_id: sensorId })
+            .sort({ createdAt: 1 }).limit(BLOQUE_HISTORIAL)
+            .select('caudal_mLmin createdAt').lean();
+        if (lote.length < BLOQUE_HISTORIAL) { archivadoEnCurso[sensorId] = false; return; }
+
+        //Promedio del caudal de ese bloque
+        const suma = lote.reduce((acc, d) => acc + (d.caudal_mLmin || 0), 0);
+        const promedio = suma / lote.length;
+
+        //Se guarda UNA fila en el historial con el promedio del bloque
+        await HistorialCaudal.create({
+            sensor_id: sensorId,
+            ubicacion: ubicacion || '',
+            caudal_promedio: Number(promedio.toFixed(2)),
+            muestras: lote.length,
+            desde: lote[0].createdAt,
+            hasta: lote[lote.length - 1].createdAt,
+        });
+
+        //Se borran las 100 lecturas crudas ya promediadas
+        const ids = lote.map(d => d._id);
+        await Medicion.deleteMany({ _id: { $in: ids } });
+
+        console.log(`[Historial] ${sensorId}: promedio ${promedio.toFixed(1)} mL/min de ${lote.length} lecturas (archivadas y borradas)`);
+    } catch (err) {
+        console.error(`[Historial] Error archivando ${sensorId}:`, err.message);
+    } finally {
+        archivadoEnCurso[sensorId] = false;
+    }
+}
+
 //Aca se inicia la función donde se ingesta los datos desde MQTT
 function iniciarIngesta() {
     //Se suscriben al topic de los sensores
@@ -153,6 +210,9 @@ function iniciarIngesta() {
             if (datos.sensor_id === 'sensor_01') {
                 await evaluarFuga();
             }
+
+            //Aca se revisa si toca archivar un bloque de 100 lecturas al historial
+            await acumularHistorial(datos.sensor_id, datos.ubicacion);
         } catch (err) {
             //si algo falla al guardar la lectura, se mostrara el error
             console.error(`[Ingesta] Error guardando lectura de ${topic}:`, err.message);
